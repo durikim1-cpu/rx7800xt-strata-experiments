@@ -1,0 +1,8 @@
+step,engine,kv,expert_ram_gib,actual_prompt_tokens,reused_tokens,runs,prompt_tok_s,decode_tok_s,ttft_s,what_changed
+before round 1 (re-measured),0.1.41 release,fp16,24,60047,0,3,437.0,29.9,137.48,baseline: official prebuilt Windows HIP engine
+round 1 combination,0.1.44.1 release + opt-ins,int8,28,60047,0,3,915.4,36.9,65.67,new engine; gfx1101 hipBLASLt table; WMMA attention; int8 KV; MTP side stream; adapt 16; prefill 8192
+round 2 prompt-first,private build,int8,26,60047,0,3,1031.1,33.1,58.32,compact MMQ scratch; selected kernels
+round 3 layer-major,private build,int8,20,60047,0,3,1177.4,27.0,51.10,layer-major prefill (vizdatom's code ported) 16K super-chunk
+round 3 shared arena + guard,private build,int8,23,60047,0,3,1408.9,27.5,42.70,layer-major staging borrowed from the expert-cache arena; 32K super-chunk
+round 5 fetch + IO,private build,int8,23,60047,0,3,1413.4,33.0,42.56,persistent expert-fetch team; CPU/IO overlap; no extra buffer
+round 6 adopted,private build,int8,19,60047,0,3,1476.4,36.0,40.74,Windows cached ReadFile after load (same binary OFF: 1399.8 / 28.5 / 43.08)

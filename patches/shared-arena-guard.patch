@@ -1,0 +1,223 @@
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index bdc70f0..8cc9679 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -48,6 +48,7 @@
+ #include <chrono>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <map>
+ #include <string>
+ #include <atomic>
+@@ -896,6 +897,8 @@ struct Prefill::Impl {
+     float* ple_norm = nullptr;
+     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
+     uint64_t region_bytes = 0;
++    uint8_t* lm_cache_arena = nullptr;     // non-owning: the expert cache owns the whole exclusive loan
++    uint64_t lm_cache_arena_bytes = 0;
+     PrefillStats* stats = nullptr;
+     // KV streaming: one layer's whole K/V, staged from the host copy per layer and chunk (identity layout)
+     strata::kernels::KvHostPools stage;
+@@ -920,7 +923,10 @@ struct Prefill::Impl {
+         int64_t S = 0;                       // tokens of a super-chunk (0: not allocated)
+         int64_t chunk_T = 0;                 // retained allocation's table geometry
+         bool r_dev = false;                  // its residual rows in VRAM (else R_host, copied per sub-chunk)
+-        void* dev = nullptr;                 // the one device allocation the pointers below are carved from
++        void* dev = nullptr;                 // owned allocation, or a bounded expert-cache view
++        bool cache_alias = false;
++        bool guard_active = false;
++        uint64_t alias_bytes = 0;
+         std::vector<void*> blocks;          // optional separate allocations; dev aliases the first block
+         float *mixed = nullptr, *acc = nullptr, *inj = nullptr, *R = nullptr, *w = nullptr;
+         int32_t *ids = nullptr, *tab = nullptr;
+@@ -1010,7 +1016,7 @@ void Prefill::release() {
+     if (impl_->grp_host) cudaFreeHost(impl_->grp_host);
+     if (!impl_->lm.blocks.empty()) {
+         for (void* p : impl_->lm.blocks) cudaFree(p);
+-    } else if (impl_->lm.dev) cudaFree(impl_->lm.dev);
++    } else if (impl_->lm.dev && !impl_->lm.cache_alias) cudaFree(impl_->lm.dev);
+     if (impl_->lm.R_host) cudaFreeHost(impl_->lm.R_host);
+     if (impl_->lm.tab_host) cudaFreeHost(impl_->lm.tab_host);
+     if (impl_->lm.idsw_host) cudaFreeHost(impl_->lm.idsw_host);
+@@ -1117,6 +1123,39 @@ bool compact_mmq_enabled() {
+     return on && mmq_plan().any && !mmq_plan().fallback && !fused_ring();
+ }
+ size_t compact_rows(size_t T) { return std::min(T * K, 2 * T); }
++// Experimental local HIP path: the prompt borrows this storage with the ordinary
++// chunk buffers, then returns it to the expert cache before decoding. No init or
++// relayout writes into live experts. Only the existing lend/refill protocol owns it.
++bool lm_cache_arena_enabled() {
++#if defined(STRATA_USE_HIP)
++    static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_CACHE_ARENA"); return e && std::strcmp(e,"1")==0; }();
++    return v;
++#else
++    return false;
++#endif
++}
++bool lm_cache_guard_enabled() {
++    static const bool v = [] { const char* e=std::getenv("STRATA_PREFILL_LM_CACHE_GUARD"); return e && std::strcmp(e,"1")==0; }();
++    return v;
++}
++uint64_t lm_cache_arena_size(size_t T) {
++    if (!lm_cache_arena_enabled() || T != 4096 || !compact_mmq_enabled()) return 0;
++    const char* lm=std::getenv("STRATA_PREFILL_LAYER_MAJOR");
++    const char* rr=std::getenv("STRATA_PREFILL_LM_R");
++    const char* keep=std::getenv("STRATA_PREFILL_LM_RETAIN");
++    const char* split=std::getenv("STRATA_PREFILL_LM_SPLIT_ALLOC");
++    const char* target=std::getenv("STRATA_PREFILL_LM_TOKENS");
++    const int64_t S=target ? std::atoll(target) : 0;
++    if (!lm || std::atoi(lm)==0 || !rr || std::strcmp(rr,"vram")!=0 ||
++        (keep && std::atoi(keep)!=0) || (split && std::atoi(split)!=0) ||
++        (S!=16384 && S!=32768)) return 0;
++    const int64_t rows=S*K, G=(int64_t)compact_rows(T);
++    const int64_t entries=NE+rows/std::max<int64_t>(G,1)+2;
++    const uint64_t workspace=(uint64_t)S*(2*N+HC+2*K+D)*4+
++                              (uint64_t)(5*rows+3*entries)*4+4096;
++    return workspace+512; // 256-byte red zones, reserved even when checking is off
++}
++
+ size_t mmq_bounds_count(int64_t experts) {
+     return compact_mmq_enabled() ? (size_t)(3 * experts + 2) : (size_t)(2 * (experts + experts / MMQ_GROUP + 2));
+ }
+@@ -1165,6 +1204,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
+ #endif
+     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
+     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
++    if (lm_cache_arena_enabled() && (!borrow || borrow_spill || !src || !cache ||
++        next_ || helper_ || m.pp || core::peer_portable() || g.n_expert!=NE ||
++        lm_cache_arena_size((size_t)chunk)==0)) {
++        err="prefill: LM cache arena requires single-GPU HIP, a borrowed compact-MMQ 4096 chunk, VRAM residuals, LM16K/32K, RETAIN=0 and SPLIT_ALLOC=0";
++        return false;
++    }
+     if (compact_mmq_enabled()) {
+         if (next_ || helper_ || m.pp || core::peer_portable()) {
+             err = "prefill: experimental compact MMQ currently supports a single GPU without helpers"; return false;
+@@ -1419,12 +1464,21 @@ bool Prefill::carve(size_t T, void* alloc) {
+     m.ple_emb = o.take<float>(T * N, ok);
+     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
+     take_stage(o, ss, s, m.stage, ok);
++    m.lm_cache_arena=nullptr; m.lm_cache_arena_bytes=0;
++    if (m.borrowed && !m.borrow_spill && m.src && lm_cache_arena_size(T)>0) {
++        m.lm_cache_arena_bytes=lm_cache_arena_size(T);
++        m.lm_cache_arena=o.take<uint8_t>((size_t)m.lm_cache_arena_bytes,ok);
++    }
+     m.T = (int64_t) T;
+     return ok;
+ }
+ 
+ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+     Impl& m = *impl_;
++    if (m.lm.cache_alias) {
++        err="prefill: cannot rebind a live layer-major cache loan";
++        return false;
++    }
+     if (m.borrow_spill) {
+         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
+         return false;
+@@ -2012,6 +2066,8 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
+     f((size_t) strata::kernels::NG_HC_DIM);
+     strata::kernels::KvHostPools stage;
+     take_stage(o, ss, s, stage, ok);
++    if (!owned_pages && src && lm_cache_arena_size(T)>0)
++        o.take<uint8_t>((size_t)lm_cache_arena_size(T),ok);
+     return o.used + (8u << 20);   // alignment slack
+ }
+ 
+@@ -4516,9 +4572,32 @@ int64_t lm_table_ints(int64_t rows, int64_t G) { return 5 * rows + 3 * lm_entrie
+ void Prefill::lm_release() {
+     Impl& m = *impl_;
+     if (m.lm.dev) {
+-        cudaStreamSynchronize(m.cs);
++        const cudaError_t drained=cudaStreamSynchronize(m.cs);
+         cudaError_t released = cudaSuccess;
+-        if (m.lm.blocks.empty()) released = cudaFree(m.lm.dev);
++        if (m.lm.cache_alias) {
++            // Match the independent cudaFree lifetime fence. The on_chunk MTP
++            // prefill can consume R_rows on a stream outside this object too.
++            // Wait for every stream in this device context before cache refill.
++            if (drained!=cudaSuccess || cudaDeviceSynchronize()!=cudaSuccess) {
++                std::fprintf(stderr,"strata prefill: cache arena fence failed; refusing an unsafe cache return\n");
++                std::abort();
++            }
++            if (m.lm.guard_active) {
++                uint8_t guard[512];
++                auto* begin=(uint8_t*)m.lm.dev;
++                if (cudaMemcpyAsync(guard,begin-256,256,cudaMemcpyDeviceToHost,m.cs)!=cudaSuccess ||
++                    cudaMemcpyAsync(guard+256,begin+m.lm.alias_bytes,256,cudaMemcpyDeviceToHost,m.cs)!=cudaSuccess ||
++                    cudaStreamSynchronize(m.cs)!=cudaSuccess) {
++                    std::fprintf(stderr,"strata prefill: cache arena guard read failed\n");std::abort();
++                }
++                bool valid=true;
++                for(int i=0;i<256;++i) valid=valid && guard[i]==0x5a && guard[256+i]==0xa5;
++                if(!valid){std::fprintf(stderr,"strata prefill: cache arena redzone CORRUPTED\n");std::abort();}
++                std::fprintf(stderr,"strata prefill: cache arena redzones PASS\n");
++            }
++            std::fprintf(stderr,"strata prefill: cache arena view returned; no device free\n");
++        }
++        else if (m.lm.blocks.empty()) released = cudaFree(m.lm.dev);
+         else {
+             for (void* p : m.lm.blocks) {
+                 const cudaError_t x = cudaFree(p);
+@@ -4534,6 +4613,7 @@ void Prefill::lm_release() {
+         }
+     }
+     m.lm.dev = nullptr;
++    m.lm.cache_alias=false; m.lm.guard_active=false; m.lm.alias_bytes=0;
+     m.lm.mixed = m.lm.acc = m.lm.inj = m.lm.R = m.lm.w = m.lm.R2 = nullptr;
+     m.lm.ids = m.lm.tab = nullptr;
+     m.lm.S = 0;
+@@ -4563,9 +4643,12 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
+     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
+     const int64_t min_s = lm_tokens_env() > 0 ? m.T : 2 * m.T;
+     if (n < min_s) { why = "a short prompt"; return 0; }
++    if (lm_cache_arena_enabled() && (!m.lm_cache_arena || m.lm_cache_arena_bytes<512)) {
++        why="cache arena not loaned for this short chunk";return 0;
++    }
+     // Windows may keep hipFree's backing pages in the runtime cache while reducing this process's DXGI
+     // budget.  Reuse already-owned storage; a new allocation still goes through the original room check.
+-    // The object's destructor owns the final free.  No scratch region or expert slot is borrowed here.
++    // Independent retained storage is owned here. The separate cache-arena path is never retained and returns its view before decode.
+     if (lm_retain_env() && m.lm.dev) {
+         if (m.lm.chunk_T == m.T && m.lm.S >= min_s) {
+             size_t fb = 0, tb = 0;
+@@ -4589,7 +4672,13 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
+     };
+     size_t free_b = 0, total_b = 0;
+     cudaMemGetInfo(&free_b, &total_b);
+-    const int64_t room = (int64_t) free_b - lm_margin_bytes();
++    const bool cache_view=lm_cache_arena_enabled() && m.lm_cache_arena && m.lm_cache_arena_bytes>=512;
++    if(cache_view && (int64_t)free_b<lm_margin_bytes()) {
++        why="cache arena preserves the original free-VRAM margin";return 0;
++    }
++    // The arena is already allocated/resident in the expert cache. Charge its
++    // bounded capacity once, while separately preserving the original free margin.
++    const int64_t room=cache_view ? (int64_t)(m.lm_cache_arena_bytes-512) : (int64_t)free_b-lm_margin_bytes();
+     m.lm.free_mib = (int64_t) (free_b >> 20);
+     auto fit = [&](bool r_dev) {   // the largest super-chunk (a multiple of the chunk) that fits `room`
+         int64_t s = S;
+@@ -4632,7 +4721,23 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
+     const uint64_t bytes = dev_bytes(s_use, r_dev);
+     void* d = nullptr;
+     const bool split = lm_split_alloc_env();
+-    if (!split && cudaMalloc(&d, bytes) != cudaSuccess) {
++    if(cache_view) {
++        if(split || !r_dev || bytes>m.lm_cache_arena_bytes-512) {
++            why="cache arena view does not fit its exclusive loan";return 0;
++        }
++        d=m.lm_cache_arena+256;
++        lb.cache_alias=true;lb.alias_bytes=bytes;lb.guard_active=false;
++        if(lm_cache_guard_enabled()) {
++            if(cudaMemsetAsync(m.lm_cache_arena,0x5a,256,m.cs)!=cudaSuccess ||
++               cudaMemsetAsync((uint8_t*)d+bytes,0xa5,256,m.cs)!=cudaSuccess) {
++                std::fprintf(stderr,"strata prefill: cache arena guard init failed\n");std::abort();
++            }
++            lb.guard_active=true;
++        }
++        std::fprintf(stderr,"strata prefill: LM cache arena alias %llu MiB in %llu MiB borrowed tail; no device allocation\n",
++                     (unsigned long long)(bytes>>20),(unsigned long long)(m.lm_cache_arena_bytes>>20));
++    }
++    else if (!split && cudaMalloc(&d, bytes) != cudaSuccess) {
+         cudaGetLastError();
+         why = "the super-chunk's buffers (" + std::to_string(bytes >> 20) + " MiB) do not fit";
+         return 0;

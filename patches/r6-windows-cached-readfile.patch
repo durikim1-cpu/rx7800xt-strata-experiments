@@ -1,0 +1,82 @@
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 4878c11..1634a65 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -1723,6 +1723,61 @@ bool FileExpertSource::recheck_unbuffered(std::string& why) {
+ bool FileExpertSource::drop_mapping(std::string& why) {
+ #if defined(_WIN32)
+     if (direct_.empty()) { why = "the reads are not unbuffered"; return false; }
++    // R6 opt-in, called only AFTER the final view/section/handle is closed.
++    // open_direct and begin/end_startup_unbuffered stay completely unchanged.
++    // The current native pack uses experts.bin; the GGUF fallback is also
++    // supported, without enabling cached reads during initial RAM/GPU fill.
++    auto r6_reopen_cached = [&] {
++        const char* r6_cache_env = std::getenv("STRATA_R6_FILE_READ_CACHE");
++        if (r6_cache_env != nullptr && std::atoi(r6_cache_env) == 1) {
++            std::vector<void*> original_handles = std::move(direct_);
++            direct_.clear();
++            std::vector<std::vector<uint8_t>> reference;
++            const int64_t layers[3] = {0, n_layers_ / 2, n_layers_ - 1};
++            const int64_t experts[3] = {0, n_expert_ / 2, n_expert_ - 1};
++            bool ok = n_layers_ > 0 && n_expert_ > 0;
++            // Read the reference with the original unbuffered handles.
++            direct_.swap(original_handles);
++            for (int i = 0; ok && i < 3; ++i) {
++                reference.emplace_back((size_t) layer_blob_bytes_[(size_t) layers[i]]);
++                const Fill f{0, layers[i], experts[i], reference.back().data()};
++                ok = !reference.back().empty() && read_direct(&f, 1);
++            }
++            direct_.swap(original_handles);
++            std::string reopen_why;
++            for (const std::string& path : paths_) {
++                if (!ok) break;
++                const int wide = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
++                std::vector<wchar_t> w((size_t) (wide > 0 ? wide : 1), L'\0');
++                if (wide > 0) MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, w.data(), wide);
++                HANDLE h = CreateFileW(w.data(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
++                                       FILE_FLAG_OVERLAPPED, nullptr);
++                if (h == INVALID_HANDLE_VALUE) {
++                    reopen_why = "cached CreateFileW error " + std::to_string((unsigned long long) GetLastError());
++                    ok = false;
++                    break;
++                }
++                direct_.push_back(h);
++            }
++            for (int i = 0; ok && i < 3; ++i) {
++                std::vector<uint8_t> check(reference[(size_t) i].size());
++                const Fill f{0, layers[i], experts[i], check.data()};
++                for (int repeat = 0; ok && repeat < 2; ++repeat) {
++                    ok = read_direct(&f, 1) &&
++                         std::memcmp(check.data(), reference[(size_t) i].data(), check.size()) == 0;
++                }
++            }
++            if (ok) {
++                for (void* h : original_handles) close_direct(h);
++                why += "; R6 Windows cached ReadFile active; flags=0x40000000; byte-probe PASS (3 blobs x 2 reads); source=";
++                why += maps_.empty() ? "experts.bin" : "GGUF shards";
++            } else {
++                for (void* h : direct_) close_direct(h);
++                direct_ = std::move(original_handles);
++                why += "; R6 cached ReadFile NOT activated; original handles restored: " + reopen_why;
++            }
++        }
++    };
+     if (!role_ptr_.empty() || !maps_.empty()) {
+         // the GGUF in place: nothing in the engine reads the shards through these views any more (the token embedding is
+         // copied into pinned host memory at load, the dense weights and the head into VRAM, the PLE table has its own
+@@ -1742,6 +1797,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
+         std::snprintf(note, sizeof note, "%zu GGUF shard%s unmapped; every expert outside RAM and VRAM is read unbuffered",
+                       maps_.size(), maps_.size() == 1 ? "" : "s");
+         why = note;
++        r6_reopen_cached();
+         return true;
+     }
+     if (base_ == nullptr || unmapped_) { why = base_ == nullptr ? "not open" : "already closed"; return unmapped_; }
+@@ -1753,6 +1809,7 @@ bool FileExpertSource::drop_mapping(std::string& why) {
+     if (file_ != nullptr) CloseHandle((HANDLE) file_);
+     file_ = nullptr;
+     why = "every expert outside RAM and VRAM is read unbuffered";
++    r6_reopen_cached();
+     return true;
+ #else
+     // Linux's page cache has no such lock: only the tests close the GGUF views (STRATA_TEST_UNMAP_GGUF=1), to run the
